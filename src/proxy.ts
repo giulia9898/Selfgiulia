@@ -1,5 +1,9 @@
 /**
  * HLS Proxy helpers — shared between addon.ts, vixsrc.ts, vixcloud.ts
+ *
+ * Uses a server-side header cache so proxy tokens stay short.
+ * Without this, every segment URL embeds the full CDN URL + all headers (~1500 chars)
+ * which exceeds URL length limits in many HLS players.
  */
 
 export const VIXSRC_HEADERS: Record<string, string> = {
@@ -17,10 +21,44 @@ export const VIXCLOUD_HEADERS: Record<string, string> = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:131.0) Gecko/20100101 Firefox/131.0'
 };
 
+// ── Header Cache: store headers server-side, reference by short ID ──
+const headerCache = new Map<string, { headers: Record<string, string>; expire: number }>();
+let headerIdCounter = 0;
+
+function registerHeaders(headers: Record<string, string>, ttlMs: number): string {
+    // Reuse existing ID if same headers already cached
+    for (const [id, entry] of headerCache) {
+        if (entry.expire > Date.now() && JSON.stringify(entry.headers) === JSON.stringify(headers)) {
+            return id;
+        }
+    }
+    const id = 'h' + (++headerIdCounter);
+    headerCache.set(id, { headers, expire: Date.now() + ttlMs });
+    return id;
+}
+
+function lookupHeaders(id: string): Record<string, string> | null {
+    const entry = headerCache.get(id);
+    if (!entry || entry.expire < Date.now()) {
+        headerCache.delete(id);
+        return null;
+    }
+    return entry.headers;
+}
+
+// Cleanup expired entries periodically
+setInterval(() => {
+    const now = Date.now();
+    for (const [id, entry] of headerCache) {
+        if (entry.expire < now) headerCache.delete(id);
+    }
+}, 10 * 60 * 1000);
+
 export function makeProxyToken(url: string, headers: Record<string, string>, ttlMs: number = 6 * 3600 * 1000): string {
+    const hid = registerHeaders(headers, ttlMs);
     const payload = {
         u: url,
-        h: headers,
+        hid,
         e: Date.now() + ttlMs
     };
     return Buffer.from(JSON.stringify(payload)).toString('base64url');
@@ -28,7 +66,17 @@ export function makeProxyToken(url: string, headers: Record<string, string>, ttl
 
 export function decodeProxyToken(token: string): { u: string; h: Record<string, string>; e: number } | null {
     try {
-        return JSON.parse(Buffer.from(token, 'base64url').toString('utf8'));
+        const raw = JSON.parse(Buffer.from(token, 'base64url').toString('utf8'));
+        // Support both old format (h: {...}) and new format (hid: "h1")
+        let headers: Record<string, string>;
+        if (raw.hid) {
+            const cached = lookupHeaders(raw.hid);
+            if (!cached) return null; // headers expired
+            headers = cached;
+        } else {
+            headers = raw.h || {};
+        }
+        return { u: raw.u, h: headers, e: raw.e || 0 };
     } catch {
         return null;
     }
